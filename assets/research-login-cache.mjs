@@ -31,6 +31,8 @@ export class SessionCredentialCache {
     try{this.storage().setItem(CACHE_KEY,JSON.stringify(record));return {status:'saved',expiresAt:record.expiresAt};}
     catch{return {status:'unavailable',expiresAt:record.expiresAt};}
   }
+  // UI-only preflight: no identity, database access or token grant is established.
+  hasCandidate(clientId){try{const raw=this.storage().getItem(CACHE_KEY);if(typeof raw!=='string'||raw.length>60000)return false;const record=JSON.parse(raw);return validRecord(record,clientId,this.now())&&record.expiresAt>this.now()+EXPIRY_SKEW_MS;}catch{return false;}}
   async read(clientId){
     let raw,record;
     try{raw=this.storage().getItem(CACHE_KEY);}catch{return {status:'unavailable'};}

@@ -2,11 +2,13 @@ import {validClientId,loadGoogleIdentity,verifyGoogleCredential,DRIVE_SCOPE} fro
 import {GOOGLE_CLIENT_ID} from './research-config.mjs';
 import {session,verifyDriveAccount} from './research-session.mjs';
 import {SessionCredentialCache,MAX_SESSION_MS,EXPIRY_SKEW_MS} from './research-login-cache.mjs';
+import {ViewStateStore,paintPendingView} from './research-view.mjs';
 const $=selector=>document.querySelector(selector);
 const cache=new SessionCredentialCache({storage:()=>sessionStorage,now:()=>Date.now(),verifyCredential:verifyGoogleCredential});
 let nonce,credential,credentialNonce,clientId,tokenClient,entered=false,pendingAuthorization=false;
 let initializing=false,initialized=false,verifyingIdentity=false,preparingGoogle;
-let sessionExpiresAt=0,expiryTimer,sessionExpired=false;
+let sessionExpiresAt=0,expiryTimer,sessionExpired=false,pendingView=false,workspaceAccountId=null;
+const viewStore=new ViewStateStore({storage:()=>sessionStorage});
 const LOGIN_MODE_KEY='research-login-mode';
 const status=message=>{$('#loginStatus').textContent=message;};
 const warning=message=>{$('#sessionWarning').textContent=message;$('#sessionWarning').hidden=!message;};
@@ -16,7 +18,15 @@ function signedOut(){try{return sessionStorage.getItem(LOGIN_MODE_KEY)==='signed
 function rememberSignOut(){try{sessionStorage.setItem(LOGIN_MODE_KEY,'signed-out');}catch{}}
 function clearSignOut(){try{sessionStorage.removeItem(LOGIN_MODE_KEY);}catch{}}
 function connectionBusy(value){$('#authorizeDrive').disabled=value;$('#reauthorizeDrive').disabled=value;}
-function showLogin(){ $('#sessionLoading').hidden=true;$('#loginGate').hidden=false; }
+function showLogin(){pendingView=false;$('#sessionLoading').hidden=true;$('#researchApp').hidden=true;$('#researchApp').inert=true;$('#loginGate').hidden=false;}
+function showPendingView(){
+  pendingView=true;const view=viewStore.read();paintPendingView(document,view);
+  $('#sessionLoading').hidden=true;$('#loginGate').hidden=true;
+  if(window.history)window.history.scrollRestoration='manual';
+  $('#researchApp').style.minHeight=(view.scrollY+window.innerHeight)+'px';
+  requestAnimationFrame(()=>window.scrollTo(view.scrollX,view.scrollY));
+}
+function offerRestoreRetry(message){if(!pendingView)showLogin();$('#retrySessionRestore').hidden=false;warning(message);}
 function identityDeadline(){return session.identity?Math.min(session.identity.expiresAt,session.identity.issuedAt+MAX_SESSION_MS):0;}
 function expireSession(){
   if(sessionExpired)return;
@@ -46,10 +56,16 @@ $('#authorizeDrive').hidden=true;$('#googleSignIn').hidden=true;
 $('#loginGate').hidden=true;$('#retrySessionRestore').hidden=true;
 async function enterWorkspace(){
   if(entered)return;
+  const accountId=session.identity?.sub;if(!accountId)throw new Error('請先完成Google登入。');
+  if(workspaceAccountId&&workspaceAccountId!==accountId)throw new Error('此分頁已初始化另一帳號，請重新整理後再登入，以確保研究資料隔離。');
+  workspaceAccountId=accountId;
   status('正在檢查自己的Drive文字資料，完成後才顯示研究…');
-  await import('./research-app.mjs');session.authorization.get();entered=true;
+  const app=await import('./research-app.mjs');session.authorization.get();
   $('#accountLabel').textContent=session.identity.label;
   $('#sessionLoading').hidden=true;$('#loginGate').hidden=true;$('#researchApp').hidden=false;
+  $('#researchApp').style.minHeight='';
+  await app?.restoreViewPosition?.();
+  $('#researchApp').inert=false;$('#researchApp').removeAttribute('aria-busy');pendingView=false;entered=true;
 }
 async function handleCredential(response){
   if(verifyingIdentity||session.identity||entered)return;
@@ -108,10 +124,11 @@ async function initializeGoogleLogin(){
   clientId=GOOGLE_CLIENT_ID||$('#loginClientId').value.trim();
   if(!validClientId(clientId)){showLogin();status('尚缺此網站專用的Google Web OAuth Client ID。請由網站管理者設定；不要輸入Client Secret。');return;}
   initializing=true;$('#retrySessionRestore').hidden=true;
+  if(!signedOut()&&cache.hasCandidate(clientId)&&!pendingView)showPendingView();
   try{
     const loggedOut=signedOut();if(loggedOut)cache.clear();
     const saved=loggedOut?{status:'missing'}:await cache.read(clientId);
-    if(saved.status==='retry'){showLogin();$('#retrySessionRestore').hidden=false;warning('暫時無法驗證既有Google登入，尚未載入研究；快取保留原期限，請稍後重試。');return;}
+    if(saved.status==='retry'){offerRestoreRetry('暫時無法驗證既有Google登入，尚未載入研究；快取保留原期限，請稍後重試。');return;}
     if(saved.status==='ready'){
       try{
         session.authorization.restore(saved.record.accessToken,saved.record.expiresAt);await verifyDriveAccount(session.authorization.get(),saved.identity.sub);
@@ -121,7 +138,7 @@ async function initializeGoogleLogin(){
         prepareGoogle(false).catch(error=>warning('已恢復限時登入；'+error.message+' 目前研究可繼續，重新連接時再重試。'));return;
       }catch(error){
         session.authorization.clear();session.identity=null;credential=null;clearTimeout(expiryTimer);
-        if(error.code==='DRIVE_NETWORK'){showLogin();$('#retrySessionRestore').hidden=false;warning('暫時無法驗證Drive連線，尚未載入研究；快取保留原期限，請稍後重試。');return;}
+        if(error.code==='DRIVE_NETWORK'){offerRestoreRetry('暫時無法驗證Drive連線，尚未載入研究；快取保留原期限，請稍後重試。');return;}
         cache.clear();warning('無法恢復既有登入或Drive連線：'+error.message+' 請重新登入。');
       }
     }else if(saved.status==='expired')warning('登入或Drive連線已到期，請重新登入與連接；本機已儲存研究仍保留。');
@@ -140,7 +157,7 @@ $('#authorizeDrive').onclick=()=>{try{session.reauthorize?.();}catch(error){stat
 $('#reauthorizeDrive').onclick=()=>{try{session.reauthorize?.();}catch(error){$('#status').textContent=error.message;}};
 function logoutGoogle(){
   const event=new CustomEvent('research-before-logout',{cancelable:true});if(!window.dispatchEvent(event))return;
-  clearTimeout(expiryTimer);cache.clear();rememberSignOut();credential=null;session.authorization.clear();authorizationChanged();session.identity=null;
+  clearTimeout(expiryTimer);cache.clear();viewStore.clear();rememberSignOut();credential=null;session.authorization.clear();authorizationChanged();session.identity=null;
   globalThis.google?.accounts?.id?.disableAutoSelect();location.reload();
 }
 $('#logoutGoogle').onclick=logoutGoogle;$('#switchGoogle').onclick=logoutGoogle;
