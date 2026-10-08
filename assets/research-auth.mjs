@@ -9,5 +9,5 @@ export class MemoryAuthorization {
   constructor(now=()=>Date.now()){this.now=now;this.clear();}
   clear(){this.token=null;this.expiresAt=0;}
   accept(response){this.clear();if(response?.error||typeof response?.access_token!=='string'||!response.access_token||!Number.isFinite(Number(response.expires_in))||Number(response.expires_in)<=0||!String(response.scope??'').split(' ').includes(DRIVE_SCOPE))throw new Error('Drive授權失敗或未提供必要權限。');this.token=response.access_token;this.expiresAt=this.now()+Number(response.expires_in)*1000;}
-  get(){if(!this.token||this.now()+30000>=this.expiresAt){this.clear();throw new Error('Drive授權已到期，請重新授權；本機資料仍保留。');}return this.token;}
+  get(){if(!this.token||this.now()+30000>=this.expiresAt){this.clear();throw new Error('Drive連線憑證已到期，請重新連接；既有Google授權不會因此撤銷，本機資料仍保留。');}return this.token;}
 }
