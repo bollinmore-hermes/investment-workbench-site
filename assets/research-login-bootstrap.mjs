@@ -31,8 +31,9 @@ function identityDeadline(){return session.identity?Math.min(session.identity.ex
 function expireSession(){
   if(sessionExpired)return;
   sessionExpired=true;clearTimeout(expiryTimer);cache.clear();session.authorization.clear();
-  if(identityDeadline()<=Date.now()+EXPIRY_SKEW_MS)$('#googleIdentityStatus').textContent='登入已到期';
-  warning('登入或Drive連線已到期；雲端同步已停止，研究與草稿保留。請先儲存或備份草稿，再按「重新連接Drive」。');
+  const identityExpired=identityDeadline()<=Date.now()+EXPIRY_SKEW_MS;
+  if(identityExpired)$('#googleIdentityStatus').textContent='登入已到期';
+  warning('本次 Drive 連線已到期；雲端同步已停止，研究與草稿保留。這不代表 Google 既有權限已被撤銷。'+(identityExpired?'Google 登入也已到期；請先儲存或備份草稿，再按「重新連接 Drive」重新登入並連接。':'請按「重新連接 Drive」取得新的連線憑證。'));
   authorizationChanged();
 }
 function checkSessionExpiry(){if(sessionExpiresAt&&Date.now()+EXPIRY_SKEW_MS>=sessionExpiresAt)expireSession();}
@@ -48,7 +49,7 @@ window.addEventListener('research-authorization-change',()=>{
   if(!entered||session.authorization.token||sessionExpired)return;
   cache.clear();
   if(Date.now()+EXPIRY_SKEW_MS>=sessionExpiresAt){expireSession();return;}
-  warning('Drive連線已失效，雲端同步暫停；研究與草稿保留。請按「重新連接Drive」重試。');
+  warning('本次 Drive 連線無法使用，雲端同步暫停；研究與草稿保留。請按「重新連接 Drive」重試；這不代表 Google 既有權限已被撤銷。');
 });
 $('#loginClientId').value=GOOGLE_CLIENT_ID;
 $('#loginConfig').hidden=validClientId(GOOGLE_CLIENT_ID);
@@ -74,8 +75,8 @@ async function handleCredential(response){
     const identity=await verifyGoogleCredential(response.credential,{clientId,nonce});
     cache.clear();session.authorization.clear();session.identity=identity;
     credential=response.credential;credentialNonce=nonce;clearSignOut();authorizationChanged();
-    $('#googleSignIn').hidden=true;$('#authorizeDrive').textContent='連接自己的Drive並進入';$('#authorizeDrive').hidden=false;
-    status('已確認Google身分：'+identity.label+'。請點「連接自己的Drive並進入」；已同意且權限未變更時，不強制重複同意。');
+    $('#googleSignIn').hidden=true;$('#authorizeDrive').textContent='連接 Drive，載入研究';$('#authorizeDrive').hidden=false;
+    status('Google 登入已完成：'+identity.label+'。請連接 Drive 以載入研究；若先前已同意且權限未變更，通常不需再次同意。');
   }catch(error){
     credential=null;session.identity=null;session.authorization.clear();cache.clear();authorizationChanged();
     $('#authorizeDrive').hidden=true;$('#googleSignIn').hidden=false;status(error.message);
@@ -102,10 +103,10 @@ function beginDriveConnection(){
     if(entered){expireSession();const guard=new CustomEvent('research-before-logout',{cancelable:true});if(!window.dispatchEvent(guard))return;}
     cache.clear();location.reload();return;
   }
-  if(!tokenClient){driveStatus('正在載入Google連線服務，請稍後再點「重新連接Drive」。');prepareGoogle(false).catch(error=>warning(error.message));return;}
+  if(!tokenClient){driveStatus('正在載入 Google 連線服務，請稍後再點「'+(entered?'重新連接 Drive':'連接 Drive，載入研究')+'」。');prepareGoogle(false).catch(error=>warning(error.message));return;}
   pendingAuthorization=true;connectionBusy(true);
   try{tokenClient.requestAccessToken({prompt:'',login_hint:session.identity.sub});}
-  catch(error){pendingAuthorization=false;connectionBusy(false);driveStatus('無法開啟Drive連線視窗：'+error.message+' 請再點一次「連接Drive」。');}
+  catch(error){pendingAuthorization=false;connectionBusy(false);driveStatus('無法開啟 Drive 連線視窗：'+error.message+' 請重新點「'+(entered?'重新連接 Drive':'連接 Drive，載入研究')+'」。');}
 }
 function prepareGoogle(recover){
   if(tokenClient)return Promise.resolve();if(preparingGoogle)return preparingGoogle;
@@ -115,7 +116,7 @@ function prepareGoogle(recover){
     $('#googleSignIn').replaceChildren();
     google.accounts.id.renderButton($('#googleSignIn'),{type:'standard',theme:'outline',size:'large',text:'signin_with',width:280});
     $('#googleSignIn').hidden=entered||!!session.identity;
-    tokenClient=google.accounts.oauth2.initTokenClient({client_id:clientId,scope:DRIVE_SCOPE+' openid email',include_granted_scopes:false,prompt:'',callback:handleDriveResponse,error_callback:()=>{pendingAuthorization=false;connectionBusy(false);driveStatus('Drive連線視窗未完成，請點「連接Drive」重試；這不代表既有權限已被撤銷。');}});
+    tokenClient=google.accounts.oauth2.initTokenClient({client_id:clientId,scope:DRIVE_SCOPE+' openid email',include_granted_scopes:false,prompt:'',callback:handleDriveResponse,error_callback:()=>{pendingAuthorization=false;connectionBusy(false);driveStatus('Drive 連線未完成，請重新點「'+(entered?'重新連接 Drive':'連接 Drive，載入研究')+'」；這不代表 Google 既有權限已被撤銷。');}});
     if(recover){try{google.accounts.id.prompt();}catch{status('瀏覽器未能自動恢復登入，請使用Google官方登入按鈕；尚未載入研究資料。');}}
   })().finally(()=>{preparingGoogle=null;});return preparingGoogle;
 }
@@ -141,7 +142,7 @@ async function initializeGoogleLogin(){
         if(error.code==='DRIVE_NETWORK'){offerRestoreRetry('暫時無法驗證Drive連線，尚未載入研究；快取保留原期限，請稍後重試。');return;}
         cache.clear();warning('無法恢復既有登入或Drive連線：'+error.message+' 請重新登入。');
       }
-    }else if(saved.status==='expired')warning('登入或Drive連線已到期，請重新登入與連接；本機已儲存研究仍保留。');
+    }else if(saved.status==='expired')warning('上次保存的登入或 Drive 連線憑證已到期。請先登入 Google，再連接 Drive 以載入研究；這不代表 Google 既有權限已被撤銷，本機已儲存研究仍保留。');
     else if(saved.status==='invalid')warning('保存的登入憑證無效，已清除；請重新登入。');
     else if(saved.status==='unavailable')warning('瀏覽器不允許儲存限時登入；重新整理後需再次登入與連接Drive。');
     showLogin();const recover=!loggedOut&&['missing','unavailable'].includes(saved.status);
