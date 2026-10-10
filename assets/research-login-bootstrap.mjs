@@ -1,22 +1,24 @@
 import {validClientId,loadGoogleIdentity,verifyGoogleCredential,DRIVE_SCOPE} from './research-auth.mjs';
 import {GOOGLE_CLIENT_ID} from './research-config.mjs';
 import {session,verifyDriveAccount} from './research-session.mjs';
-import {SessionCredentialCache,MAX_SESSION_MS,EXPIRY_SKEW_MS} from './research-login-cache.mjs';
+import {IndexedDBLoginStorage,SessionCredentialCache,CACHE_KEY,LOGIN_MODE_KEY,MAX_SESSION_MS,EXPIRY_SKEW_MS} from './research-login-cache.mjs';
 import {ViewStateStore,paintPendingView} from './research-view.mjs';
 const $=selector=>document.querySelector(selector);
-const cache=new SessionCredentialCache({storage:()=>sessionStorage,now:()=>Date.now(),verifyCredential:verifyGoogleCredential});
+const loginStorage=new IndexedDBLoginStorage();
+const cache=new SessionCredentialCache({storage:()=>loginStorage,now:()=>Date.now(),verifyCredential:verifyGoogleCredential});
+// Older same-tab credentials are not migrated or used to renew a persistent login.
+try{sessionStorage.removeItem(CACHE_KEY);}catch{}
 let nonce,credential,credentialNonce,clientId,tokenClient,entered=false,pendingAuthorization=false;
 let initializing=false,initialized=false,verifyingIdentity=false,preparingGoogle;
 let sessionExpiresAt=0,expiryTimer,sessionExpired=false,pendingView=false,workspaceAccountId=null;
 const viewStore=new ViewStateStore({storage:()=>sessionStorage});
-const LOGIN_MODE_KEY='research-login-mode';
 const status=message=>{$('#loginStatus').textContent=message;};
 const warning=message=>{$('#sessionWarning').textContent=message;$('#sessionWarning').hidden=!message;};
 const authorizationChanged=()=>window.dispatchEvent(new Event('research-authorization-change'));
 const driveStatus=message=>{if(entered)$('#status').textContent=message;else status(message);};
-function signedOut(){try{return sessionStorage.getItem(LOGIN_MODE_KEY)==='signed-out';}catch{return false;}}
-function rememberSignOut(){try{sessionStorage.setItem(LOGIN_MODE_KEY,'signed-out');}catch{}}
-function clearSignOut(){try{sessionStorage.removeItem(LOGIN_MODE_KEY);}catch{}}
+async function signedOut(){try{return await loginStorage.getItem(LOGIN_MODE_KEY)==='signed-out';}catch{return false;}}
+async function rememberSignOut(){try{await loginStorage.setItem(LOGIN_MODE_KEY,'signed-out');}catch{}}
+async function clearSignOut(){try{await loginStorage.removeItem(LOGIN_MODE_KEY);}catch{}}
 function connectionBusy(value){$('#authorizeDrive').disabled=value;$('#reauthorizeDrive').disabled=value;}
 function showLogin(){pendingView=false;$('#sessionLoading').hidden=true;$('#researchApp').hidden=true;$('#researchApp').inert=true;$('#loginGate').hidden=false;}
 function showPendingView(){
@@ -44,6 +46,15 @@ function armExpiry(expiresAt){
   expiryTimer=setTimeout(checkSessionExpiry,Math.max(0,expiresAt-Date.now()-EXPIRY_SKEW_MS));
 }
 window.addEventListener('focus',checkSessionExpiry);
+window.addEventListener('storage',event=>{
+  let persistent;try{persistent=localStorage;}catch{return;}
+  if(event.storageArea!==persistent||!entered)return;
+  if(!((event.key===CACHE_KEY&&event.newValue===null)||(event.key===LOGIN_MODE_KEY&&event.newValue==='signed-out')||event.key===null))return;
+  clearTimeout(expiryTimer);sessionExpired=true;credential=null;session.identity=null;session.authorization.clear();
+  $('#googleIdentityStatus').textContent='登入已失效';
+  warning('其他視窗已登出或清除登入憑證；此頁雲端同步已停止，研究與草稿保留。請先儲存或備份草稿，再重新整理登入。');
+  authorizationChanged();
+});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)checkSessionExpiry();});
 window.addEventListener('research-authorization-change',()=>{
   if(!entered||session.authorization.token||sessionExpired)return;
@@ -73,12 +84,12 @@ async function handleCredential(response){
   verifyingIdentity=true;
   try{
     const identity=await verifyGoogleCredential(response.credential,{clientId,nonce});
-    cache.clear();session.authorization.clear();session.identity=identity;
-    credential=response.credential;credentialNonce=nonce;clearSignOut();authorizationChanged();
+    await cache.clear();session.authorization.clear();session.identity=identity;
+    credential=response.credential;credentialNonce=nonce;await clearSignOut();authorizationChanged();
     $('#googleSignIn').hidden=true;$('#authorizeDrive').textContent='連接 Drive，載入研究';$('#authorizeDrive').hidden=false;
     status('Google 登入已完成：'+identity.label+'。請連接 Drive 以載入研究；若先前已同意且權限未變更，通常不需再次同意。');
   }catch(error){
-    credential=null;session.identity=null;session.authorization.clear();cache.clear();authorizationChanged();
+    credential=null;session.identity=null;session.authorization.clear();await cache.clear();authorizationChanged();
     $('#authorizeDrive').hidden=true;$('#googleSignIn').hidden=false;status(error.message);
   }finally{verifyingIdentity=false;}
 }
@@ -87,13 +98,13 @@ async function handleDriveResponse(response){
   try{
     if(!session.identity)throw new Error('請先完成Google登入。');
     session.authorization.accept(response);await verifyDriveAccount(session.authorization.get(),session.identity.sub);
-    const saved=cache.save({clientId,credential,nonce:credentialNonce,accessToken:session.authorization.token,accessExpiresAt:session.authorization.expiresAt,identity:session.identity});
+    const saved=await cache.save({clientId,credential,nonce:credentialNonce,accessToken:session.authorization.token,accessExpiresAt:session.authorization.expiresAt,identity:session.identity});
     if(!['saved','unavailable'].includes(saved.status))throw new Error('登入憑證已到期或期限無效，請先儲存草稿，再重新登入。');
     session.authorization.restore(session.authorization.token,saved.expiresAt);armExpiry(saved.expiresAt);
-    warning(saved.status==='unavailable'?'瀏覽器不允許儲存限時登入；本次可使用，但重新整理後需再次登入與連接Drive。':'');
+    warning(saved.status==='unavailable'?'瀏覽器不允許儲存限時登入；本次可使用，但重新整理或重開App後需再次登入與連接Drive。':'');
     authorizationChanged();
     if(!entered)await enterWorkspace();else $('#status').textContent='Drive已重新連接；請按「同步文字資料」檢查雲端版本。';
-  }catch(error){cache.clear();session.authorization.clear();authorizationChanged();driveStatus(error.message);}
+  }catch(error){await cache.clear();session.authorization.clear();authorizationChanged();driveStatus(error.message);}
   finally{pendingAuthorization=false;connectionBusy(false);}
 }
 function beginDriveConnection(){
@@ -125,26 +136,26 @@ async function initializeGoogleLogin(){
   clientId=GOOGLE_CLIENT_ID||$('#loginClientId').value.trim();
   if(!validClientId(clientId)){showLogin();status('尚缺此網站專用的Google Web OAuth Client ID。請由網站管理者設定；不要輸入Client Secret。');return;}
   initializing=true;$('#retrySessionRestore').hidden=true;
-  if(!signedOut()&&cache.hasCandidate(clientId)&&!pendingView)showPendingView();
+  if(!await signedOut()&&await cache.hasCandidate(clientId)&&!pendingView)showPendingView();
   try{
-    const loggedOut=signedOut();if(loggedOut)cache.clear();
+    const loggedOut=await signedOut();if(loggedOut)await cache.clear();
     const saved=loggedOut?{status:'missing'}:await cache.read(clientId);
     if(saved.status==='retry'){offerRestoreRetry('暫時無法驗證既有Google登入，尚未載入研究；快取保留原期限，請稍後重試。');return;}
     if(saved.status==='ready'){
       try{
         session.authorization.restore(saved.record.accessToken,saved.record.expiresAt);await verifyDriveAccount(session.authorization.get(),saved.identity.sub);
         session.identity=saved.identity;credential=saved.record.credential;credentialNonce=saved.record.nonce;
-        armExpiry(saved.record.expiresAt);clearSignOut();warning('');await enterWorkspace();initialized=true;$('#loginClientId').readOnly=true;
+        armExpiry(saved.record.expiresAt);await clearSignOut();warning('');await enterWorkspace();initialized=true;$('#loginClientId').readOnly=true;
         // Valid-cache restoration never requests a new token or opens One Tap.
         prepareGoogle(false).catch(error=>warning('已恢復限時登入；'+error.message+' 目前研究可繼續，重新連接時再重試。'));return;
       }catch(error){
         session.authorization.clear();session.identity=null;credential=null;clearTimeout(expiryTimer);
         if(error.code==='DRIVE_NETWORK'){offerRestoreRetry('暫時無法驗證Drive連線，尚未載入研究；快取保留原期限，請稍後重試。');return;}
-        cache.clear();warning('無法恢復既有登入或Drive連線：'+error.message+' 請重新登入。');
+        await cache.clear();warning('無法恢復既有登入或Drive連線：'+error.message+' 請重新登入。');
       }
     }else if(saved.status==='expired')warning('上次保存的登入或 Drive 連線憑證已到期。請先登入 Google，再連接 Drive 以載入研究；這不代表 Google 既有權限已被撤銷，本機已儲存研究仍保留。');
     else if(saved.status==='invalid')warning('保存的登入憑證無效，已清除；請重新登入。');
-    else if(saved.status==='unavailable')warning('瀏覽器不允許儲存限時登入；重新整理後需再次登入與連接Drive。');
+    else if(saved.status==='unavailable')warning('瀏覽器不允許儲存限時登入；重新整理或重開App後需再次登入與連接Drive。');
     showLogin();const recover=!loggedOut&&['missing','unavailable'].includes(saved.status);
     status(loggedOut?'已登出；請使用Google官方登入按鈕選擇帳號。尚未載入研究資料。':'正在載入Google官方登入；尚未載入研究資料。');
     await prepareGoogle(recover);initialized=true;$('#loginClientId').readOnly=true;
@@ -156,9 +167,9 @@ session.reauthorize=beginDriveConnection;
 $('#loginClientId').onchange=initializeGoogleLogin;$('#retrySessionRestore').onclick=initializeGoogleLogin;
 $('#authorizeDrive').onclick=()=>{try{session.reauthorize?.();}catch(error){status(error.message);}};
 $('#reauthorizeDrive').onclick=()=>{try{session.reauthorize?.();}catch(error){$('#status').textContent=error.message;}};
-function logoutGoogle(){
+async function logoutGoogle(){
   const event=new CustomEvent('research-before-logout',{cancelable:true});if(!window.dispatchEvent(event))return;
-  clearTimeout(expiryTimer);cache.clear();viewStore.clear();rememberSignOut();credential=null;session.authorization.clear();authorizationChanged();session.identity=null;
+  clearTimeout(expiryTimer);credential=null;session.authorization.clear();authorizationChanged();session.identity=null;await rememberSignOut();await cache.clear();viewStore.clear();
   globalThis.google?.accounts?.id?.disableAutoSelect();location.reload();
 }
 $('#logoutGoogle').onclick=logoutGoogle;$('#switchGoogle').onclick=logoutGoogle;
