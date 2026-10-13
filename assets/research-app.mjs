@@ -5,7 +5,9 @@ import {mountAccountCenter} from './research-account.mjs';
 import {ViewStateStore,resolveView,showTabLayout} from './research-view.mjs';
 import {DriveSnapshotStore} from './research-drive.mjs';
 import {makeSnapshot,previewMerge,mergeCloudWorkspace,adoptCloudWorkspace} from './research-sync.mjs';
-if(!session.identity)throw new Error('請先完成Google登入與Drive授權。');
+if(!session.identity)throw new Error('請先完成網站登入。');
+// Keep this initialized workspace bound to its verified account even after logout.
+const workspaceAccountId=session.identity.sub;
 import {showPdf,closePdf as closePdfViewer} from './research-pdf.mjs';
 const $=selector=>document.querySelector(selector);
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -14,7 +16,7 @@ const drafts=new Map();
 const viewStore=new ViewStateStore({storage:()=>sessionStorage}),savedView=viewStore.read(session.identity.sub);
 let restoringView=true,scrollFrame,restoredView=savedView;
 tab=savedView.tab;
-function rememberView(){if(!ready||restoringView)return;viewStore.save(session.identity.sub,{page:accountCenter.page,topicId:selectedId,tab,scrollX:Math.max(0,window.scrollX),scrollY:Math.max(0,window.scrollY)});}
+function rememberView(){if(!ready||restoringView)return;viewStore.save(workspaceAccountId,{page:accountCenter.page,topicId:selectedId,tab,scrollX:Math.max(0,window.scrollX),scrollY:Math.max(0,window.scrollY)});}
 window.addEventListener('scroll',()=>{if(restoringView||scrollFrame)return;scrollFrame=requestAnimationFrame(()=>{scrollFrame=null;rememberView();});},{passive:true});
 window.addEventListener('pagehide',rememberView);
 export async function restoreViewPosition(){
@@ -61,7 +63,7 @@ channel&&(channel.onmessage=event=>{if(event.data?.revision>state.revision)notic
 window.addEventListener('beforeunload',event=>{if(drafts.size||[...document.querySelectorAll('dialog form')].some(form=>form.dataset.dirty==='true'&&form.closest('dialog').open)){event.preventDefault();event.returnValue=''}});
 const drive=new DriveSnapshotStore(()=>session.authorization.get());
 const accountCenter=mountAccountCenter({session,getWorkspace:()=>state,isReady:()=>ready,refreshUsage:()=>work(async()=>{accountCenter.local();await inspectCloud();notice('容量已重新整理；此操作不會上傳或修改研究。');}),initialPage:savedView.page,onNavigate:rememberView});
-async function inspectCloud(){accountCenter.loading();try{const graph=await drive.inspect();accountCenter.apply(graph.usage);return graph;}catch(error){if(error.status===401){session.authorization.clear();window.dispatchEvent(new Event('research-authorization-change'));}accountCenter.unavailable('無法取得：'+error.message);throw error;}}
+async function inspectCloud(){accountCenter.loading();try{const graph=await drive.inspect();accountCenter.apply(graph.usage);return graph;}catch(error){if([401,403].includes(error.status)){session.authorization.clear();window.dispatchEvent(new Event('research-authorization-change'));}accountCenter.unavailable('無法取得：'+error.message);throw error;}}
 
 const baseKey='research-sync-base-'+session.identity.sub;
 let base=null,pendingSync=null,syncTimer=null;
@@ -77,4 +79,4 @@ $('#confirmSyncMerge').onclick=()=>work(async()=>{if(!pendingSync)return;if(hasU
 $('#syncDialog').addEventListener('close',()=>{pendingSync=null;});
 $('#migrateLegacy').onclick=()=>work(async()=>{if(hasUnsaved())throw new Error('請先保存目前草稿，再預覽舊資料。');const legacy=await openDatabase();let old;try{old=await readWorkspace(legacy);}finally{legacy.close();}if(!old.topics.length){notice('此瀏覽器沒有舊版未綁定帳號的研究；另一台電腦請使用完整備份匯入。');return;}const archive=await createBackup(old),hash=await sha256(new TextEncoder().encode(JSON.stringify(archive.workspace)));if(state.importedHashes.includes(hash))throw new Error('這份舊本機研究已搬入，不會重複新增。');pendingImport=old;pendingHash=hash;$('#importError').textContent='';$('#importFile').value='';$('#importPreview').textContent='將從舊本機資料複製 '+old.topics.length+' 個主題、'+old.sources.length+' 個來源及 '+old.sources.filter(s=>s.attachment).length+' 份PDF到目前登入帳號。原資料不刪除；只有文字會同步Drive。';$('#importDialog').showModal();controls();});
 window.addEventListener('research-before-logout',event=>{if(busy||hasUnsaved()||$('#syncDialog').open){event.preventDefault();notice('請先保存或備份草稿、關閉合併預覽並等待目前操作完成，再登出。');return;}clearTimeout(syncTimer);});
-try{db=await openAccountDatabase(session.identity.sub);state=await readWorkspace(db);selectedId=resolveView(savedView,state.topics).topicId;ready=true;accountCenter.local();await work(()=>synchronize(false));restoredView=resolveView(savedView,state.topics);selectedId=restoredView.topicId;tab=restoredView.tab;render();accountCenter.show(restoredView.page,{focus:false,notify:false});}catch(error){$('#storageStatus').textContent='本機儲存不可用：'+(error?.message||'請檢查瀏覽器權限或儲存空間。');notice('沒有保存或上傳任何研究資料；請勿在儲存未就緒時輸入重要內容。')}
+try{db=await openAccountDatabase(session.identity.sub);state=await readWorkspace(db);selectedId=resolveView(savedView,state.topics).topicId;ready=true;accountCenter.local();if(session.authorization.token)await work(()=>synchronize(false));else {$('#cloudStatus').textContent='Drive 未連接，雲端同步暫停；本機研究可繼續使用。';accountCenter.unavailable('請重新連接 Drive；網站登入與雲端授權分開處理。');}restoredView=resolveView(savedView,state.topics);selectedId=restoredView.topicId;tab=restoredView.tab;render();accountCenter.show(restoredView.page,{focus:false,notify:false});}catch(error){$('#storageStatus').textContent='本機儲存不可用：'+(error?.message||'請檢查瀏覽器權限或儲存空間。');notice('沒有保存或上傳任何研究資料；請勿在儲存未就緒時輸入重要內容。')}
